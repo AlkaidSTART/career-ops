@@ -14,9 +14,10 @@
  * Run: node career-ops/merge-tracker.mjs [--dry-run] [--verify]
  */
 
-import { readFileSync, writeFileSync, readdirSync, mkdirSync, renameSync, existsSync } from 'fs';
-import { join, basename, dirname } from 'path';
+import { readFileSync, writeFileSync, readdirSync, mkdirSync, renameSync, existsSync, realpathSync } from 'fs';
+import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { execFileSync } from 'child_process';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 // Support both layouts: data/applications.md (boilerplate) and applications.md (original)
@@ -104,7 +105,9 @@ function parseTsvContent(content, filename) {
 
   // Detect pipe-delimited (markdown table row)
   if (content.startsWith('|')) {
-    parts = content.split('|').map(s => s.trim()).filter(Boolean);
+    // Strip only outer pipe delimiters so empty cells (e.g. blank PDF/notes)
+    // do not shift subsequent columns or trigger false malformed-row skips.
+    parts = content.replace(/^\|/, '').replace(/\|$/, '').split('|').map(s => s.trim());
     if (parts.length < 8) {
       console.warn(`⚠️  Skipping malformed pipe-delimited ${filename}: ${parts.length} fields`);
       return null;
@@ -174,154 +177,192 @@ function parseTsvContent(content, filename) {
   return addition;
 }
 
-// ---- Main ----
+export { validateStatus, parseAppLine, parseTsvContent };
 
-// Read applications.md
-if (!existsSync(APPS_FILE)) {
-  console.log('No applications.md found. Nothing to merge into.');
-  process.exit(0);
-}
-const appContent = readFileSync(APPS_FILE, 'utf-8');
-const appLines = appContent.split('\n');
-const existingApps = [];
-let maxNum = 0;
+function main() {
+  // Read applications.md
+  if (!existsSync(APPS_FILE)) {
+    console.log('No applications.md found. Nothing to merge into.');
+    process.exit(0);
+  }
+  const appContent = readFileSync(APPS_FILE, 'utf-8');
+  const appLines = appContent.split('\n');
+  const existingApps = [];
+  let maxNum = 0;
 
-for (const line of appLines) {
-  if (line.startsWith('|') && !line.includes('---') && !line.includes('Empresa')) {
-    const app = parseAppLine(line);
-    if (app) {
-      existingApps.push(app);
-      if (app.num > maxNum) maxNum = app.num;
+  for (let i = 0; i < appLines.length; i++) {
+    const line = appLines[i];
+    if (line.startsWith('|') && !line.includes('---') && !line.includes('Empresa')) {
+      const app = parseAppLine(line);
+      if (app) {
+        existingApps.push({ ...app, lineIdx: i, isNew: false });
+        if (app.num > maxNum) maxNum = app.num;
+      }
     }
   }
-}
 
-console.log(`📊 Existing: ${existingApps.length} entries, max #${maxNum}`);
+  console.log(`📊 Existing: ${existingApps.length} entries, max #${maxNum}`);
 
-// Read tracker additions
-if (!existsSync(ADDITIONS_DIR)) {
-  console.log('No tracker-additions directory found.');
-  process.exit(0);
-}
-
-const tsvFiles = readdirSync(ADDITIONS_DIR).filter(f => f.endsWith('.tsv'));
-if (tsvFiles.length === 0) {
-  console.log('✅ No pending additions to merge.');
-  process.exit(0);
-}
-
-// Sort files numerically for deterministic processing
-tsvFiles.sort((a, b) => {
-  const numA = parseInt(a.replace(/\D/g, '')) || 0;
-  const numB = parseInt(b.replace(/\D/g, '')) || 0;
-  return numA - numB;
-});
-
-console.log(`📥 Found ${tsvFiles.length} pending additions`);
-
-let added = 0;
-let updated = 0;
-let skipped = 0;
-const newLines = [];
-
-for (const file of tsvFiles) {
-  const content = readFileSync(join(ADDITIONS_DIR, file), 'utf-8').trim();
-  const addition = parseTsvContent(content, file);
-  if (!addition) { skipped++; continue; }
-
-  // Check for duplicate by:
-  // 1. Exact report number match
-  // 2. Company + role fuzzy match
-  const reportNum = extractReportNum(addition.report);
-  let duplicate = null;
-
-  if (reportNum) {
-    // Check if this report number already exists
-    duplicate = existingApps.find(app => {
-      const existingReportNum = extractReportNum(app.report);
-      return existingReportNum === reportNum;
-    });
+  // Read tracker additions
+  if (!existsSync(ADDITIONS_DIR)) {
+    console.log('No tracker-additions directory found.');
+    process.exit(0);
   }
 
-  if (!duplicate) {
-    // Exact entry number match
-    duplicate = existingApps.find(app => app.num === addition.num);
+  const tsvFiles = readdirSync(ADDITIONS_DIR).filter(f => f.endsWith('.tsv'));
+  if (tsvFiles.length === 0) {
+    console.log('✅ No pending additions to merge.');
+    process.exit(0);
   }
 
-  if (!duplicate) {
-    // Company + role fuzzy match
-    const normCompany = normalizeCompany(addition.company);
-    duplicate = existingApps.find(app => {
-      if (normalizeCompany(app.company) !== normCompany) return false;
-      return roleFuzzyMatch(addition.role, app.role);
-    });
-  }
+  // Sort files numerically for deterministic processing
+  tsvFiles.sort((a, b) => {
+    const numA = parseInt(a.replace(/\D/g, '')) || 0;
+    const numB = parseInt(b.replace(/\D/g, '')) || 0;
+    return numA - numB;
+  });
 
-  if (duplicate) {
-    const newScore = parseScore(addition.score);
-    const oldScore = parseScore(duplicate.score);
+  console.log(`📥 Found ${tsvFiles.length} pending additions`);
 
-    if (newScore > oldScore) {
-      console.log(`🔄 Update: #${duplicate.num} ${addition.company} — ${addition.role} (${oldScore}→${newScore})`);
-      const lineIdx = appLines.indexOf(duplicate.raw);
-      if (lineIdx >= 0) {
-        const updatedLine = `| ${duplicate.num} | ${addition.date} | ${addition.company} | ${addition.role} | ${addition.score} | ${duplicate.status} | ${duplicate.pdf} | ${addition.report} | Re-eval ${addition.date} (${oldScore}→${newScore}). ${addition.notes} |`;
-        appLines[lineIdx] = updatedLine;
+  let added = 0;
+  let updated = 0;
+  let skipped = 0;
+  let malformed = 0;
+  const newLines = [];
+  const processedFiles = [];
+
+  for (const file of tsvFiles) {
+    const content = readFileSync(join(ADDITIONS_DIR, file), 'utf-8').trim();
+    const addition = parseTsvContent(content, file);
+    if (!addition) {
+      malformed++;
+      skipped++;
+      continue;
+    }
+
+    processedFiles.push(file);
+
+    // Check for duplicate by:
+    // 1. Exact report number match
+    // 2. Exact entry number match
+    // 3. Company + role fuzzy match
+    const reportNum = extractReportNum(addition.report);
+    let duplicate = null;
+
+    if (reportNum) {
+      duplicate = existingApps.find(app => {
+        const existingReportNum = extractReportNum(app.report);
+        return existingReportNum === reportNum;
+      });
+    }
+
+    if (!duplicate) {
+      duplicate = existingApps.find(app => app.num === addition.num);
+    }
+
+    if (!duplicate) {
+      const normCompany = normalizeCompany(addition.company);
+      duplicate = existingApps.find(app => {
+        if (normalizeCompany(app.company) !== normCompany) return false;
+        return roleFuzzyMatch(addition.role, app.role);
+      });
+    }
+
+    if (duplicate) {
+      const newScore = parseScore(addition.score);
+      const oldScore = parseScore(duplicate.score);
+
+      if (newScore > oldScore) {
+        console.log(`🔄 Update: #${duplicate.num} ${addition.company} — ${addition.role} (${oldScore}→${newScore})`);
+        const updatedNotes = `Re-eval ${addition.date} (${oldScore}→${newScore}). ${addition.notes}`.trim();
+        const updatedLine = `| ${duplicate.num} | ${addition.date} | ${addition.company} | ${addition.role} | ${addition.score} | ${duplicate.status} | ${duplicate.pdf} | ${addition.report} | ${updatedNotes} |`;
+        if (duplicate.isNew) {
+          newLines[duplicate.newIdx] = updatedLine;
+        } else {
+          appLines[duplicate.lineIdx] = updatedLine;
+        }
+        // Keep in-memory state in sync so subsequent additions in the same batch
+        // compare against the updated score and write to the same row.
+        duplicate.date = addition.date;
+        duplicate.company = addition.company;
+        duplicate.role = addition.role;
+        duplicate.score = addition.score;
+        duplicate.report = addition.report;
+        duplicate.notes = updatedNotes;
+        duplicate.raw = updatedLine;
         updated++;
+      } else {
+        console.log(`⏭️  Skip: ${addition.company} — ${addition.role} (existing #${duplicate.num} ${oldScore} >= new ${newScore})`);
+        skipped++;
       }
     } else {
-      console.log(`⏭️  Skip: ${addition.company} — ${addition.role} (existing #${duplicate.num} ${oldScore} >= new ${newScore})`);
-      skipped++;
-    }
-  } else {
-    // New entry — use the number from the TSV
-    const entryNum = addition.num > maxNum ? addition.num : ++maxNum;
-    if (addition.num > maxNum) maxNum = addition.num;
+      // New entry — use the number from the TSV
+      const entryNum = addition.num > maxNum ? addition.num : ++maxNum;
+      if (addition.num > maxNum) maxNum = addition.num;
 
-    const newLine = `| ${entryNum} | ${addition.date} | ${addition.company} | ${addition.role} | ${addition.score} | ${addition.status} | ${addition.pdf} | ${addition.report} | ${addition.notes} |`;
-    newLines.push(newLine);
-    added++;
-    console.log(`➕ Add #${entryNum}: ${addition.company} — ${addition.role} (${addition.score})`);
-  }
-}
-
-// Insert new lines after the header (line index of first data row)
-if (newLines.length > 0) {
-  // Find header separator (|---|...) and insert after it
-  let insertIdx = -1;
-  for (let i = 0; i < appLines.length; i++) {
-    if (appLines[i].includes('---') && appLines[i].startsWith('|')) {
-      insertIdx = i + 1;
-      break;
+      const newLine = `| ${entryNum} | ${addition.date} | ${addition.company} | ${addition.role} | ${addition.score} | ${addition.status} | ${addition.pdf} | ${addition.report} | ${addition.notes} |`;
+      const newIdx = newLines.length;
+      newLines.push(newLine);
+      existingApps.push({
+        ...addition,
+        num: entryNum,
+        raw: newLine,
+        isNew: true,
+        newIdx,
+      });
+      added++;
+      console.log(`➕ Add #${entryNum}: ${addition.company} — ${addition.role} (${addition.score})`);
     }
   }
-  if (insertIdx >= 0) {
-    appLines.splice(insertIdx, 0, ...newLines);
+
+  // Insert new lines after the header (line index of first data row)
+  if (newLines.length > 0) {
+    let insertIdx = -1;
+    for (let i = 0; i < appLines.length; i++) {
+      if (appLines[i].includes('---') && appLines[i].startsWith('|')) {
+        insertIdx = i + 1;
+        break;
+      }
+    }
+    if (insertIdx >= 0) {
+      appLines.splice(insertIdx, 0, ...newLines);
+    }
+  }
+
+  // Write back
+  if (!DRY_RUN) {
+    if (added > 0 || updated > 0) {
+      writeFileSync(APPS_FILE, appLines.join('\n'));
+    }
+
+    // Move only successfully processed files to merged/; keep malformed files in place for review.
+    if (processedFiles.length > 0) {
+      if (!existsSync(MERGED_DIR)) mkdirSync(MERGED_DIR, { recursive: true });
+      for (const file of processedFiles) {
+        renameSync(join(ADDITIONS_DIR, file), join(MERGED_DIR, file));
+      }
+      console.log(`\n✅ Moved ${processedFiles.length} TSVs to merged/`);
+    }
+    if (malformed > 0) {
+      console.warn(`⚠️  Kept ${malformed} malformed TSV(s) in tracker-additions/ for manual review`);
+    }
+  }
+
+  console.log(`\n📊 Summary: +${added} added, 🔄${updated} updated, ⏭️${skipped} skipped`);
+  if (DRY_RUN) console.log('(dry-run — no changes written)');
+
+  // Optional verify
+  if (VERIFY && !DRY_RUN) {
+    console.log('\n--- Running verification ---');
+    try {
+      execFileSync(process.execPath, [join(CAREER_OPS, 'verify-pipeline.mjs')], { stdio: 'inherit' });
+    } catch (e) {
+      process.exit(1);
+    }
   }
 }
 
-// Write back
-if (!DRY_RUN) {
-  writeFileSync(APPS_FILE, appLines.join('\n'));
-
-  // Move processed files to merged/
-  if (!existsSync(MERGED_DIR)) mkdirSync(MERGED_DIR, { recursive: true });
-  for (const file of tsvFiles) {
-    renameSync(join(ADDITIONS_DIR, file), join(MERGED_DIR, file));
-  }
-  console.log(`\n✅ Moved ${tsvFiles.length} TSVs to merged/`);
-}
-
-console.log(`\n📊 Summary: +${added} added, 🔄${updated} updated, ⏭️${skipped} skipped`);
-if (DRY_RUN) console.log('(dry-run — no changes written)');
-
-// Optional verify
-if (VERIFY && !DRY_RUN) {
-  console.log('\n--- Running verification ---');
-  const { execSync } = await import('child_process');
-  try {
-    execSync(`node ${join(CAREER_OPS, 'verify-pipeline.mjs')}`, { stdio: 'inherit' });
-  } catch (e) {
-    process.exit(1);
-  }
+const isMain = process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+if (isMain) {
+  main();
 }
